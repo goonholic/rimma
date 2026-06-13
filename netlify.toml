@@ -1,7 +1,0 @@
-# Netlify configuration for the Rimma Sabitova site.
-# - publish = "." : the site (index.html) sits in the project root.
-# - functions   : serverless functions live in netlify/functions/ (e.g. lead.js
-#                 is reachable at /.netlify/functions/lead).
-[build]
-  publish = "."
-  functions = "netlify/functions"
