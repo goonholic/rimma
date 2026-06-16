@@ -1,0 +1,96 @@
+// api/pay.js — Robokassa: инициация платежа.  Endpoint: /api/pay?service=<code>
+//
+// Браузер присылает только КОД услуги, а сумму берём из серверного прайса ниже —
+// так пользователь не сможет подменить цену. Подпись считается секретным Паролём #1,
+// который живёт ТОЛЬКО в переменных окружения Vercel и в коде страницы не виден.
+//
+// Переменные окружения (Vercel → Settings → Environment Variables):
+//   ROBOKASSA_LOGIN        – идентификатор магазина (MerchantLogin)
+//   ROBOKASSA_PASS1        – боевой Пароль #1
+//   ROBOKASSA_TEST_PASS1   – тестовый Пароль #1
+//   ROBOKASSA_IS_TEST      – '1' = тестовый режим (тестовые пароли + IsTest=1), иначе боевой
+'use strict';
+const crypto = require('crypto');
+
+// Серверный прайс. Ключ — код услуги (его присылает кнопка на сайте), значение — цена и название.
+const SERVICES = {
+  now:       { amount: 3000,  title: 'Что со мной происходит?' },
+  year:      { amount: 8000,  title: 'Годовой прогноз: личная стратегия' },
+  career:    { amount: 5000,  title: 'Профессиональный путь' },
+  situation: { amount: 5000,  title: 'Разбор вашей ситуации' },
+  child:     { amount: 5000,  title: 'Карта потенциала ребёнка' },
+  decision:  { amount: 10000, title: 'Большие решения' },
+};
+
+function md5(s) { return crypto.createHash('md5').update(s, 'utf8').digest('hex'); }
+function redirect(res, location) { res.statusCode = 302; res.setHeader('Location', location); res.end(); }
+
+module.exports = async (req, res) => {
+  try {
+    const qp = new URL(req.url, 'http://x').searchParams;
+    const code = (qp.get('service') || '').trim();
+    const svc = SERVICES[code];
+    if (!svc) return redirect(res, '/fail.html?e=service');
+
+    const LOGIN = process.env.ROBOKASSA_LOGIN;
+    const isTest = String(process.env.ROBOKASSA_IS_TEST || '') === '1';
+    const PASS1 = isTest ? process.env.ROBOKASSA_TEST_PASS1 : process.env.ROBOKASSA_PASS1;
+
+    // Робокасса ещё не настроена (нет ключей) — заявка уже ушла в Telegram, просто говорим спасибо.
+    if (!LOGIN || !PASS1) return redirect(res, '/success.html');
+
+    const outSum = svc.amount.toFixed(2);            // "3000.00" — одна и та же строка в подписи и в ссылке
+    const invId = Math.floor(Date.now() / 1000);      // целое, влезает в диапазон Robokassa
+    // Контакт клиента едет доп. Shp-параметрами, чтобы вернуться в отстук «Оплата получена».
+    // Имя — только буквы/пробел/дефис/точка/апостроф (без ':' и т.п., что сломало бы подпись); телефон — цифры.
+    const cname  = (qp.get('n') || '').replace(/[^\p{L}\s.\-']/gu, '').trim().slice(0, 60);
+    const cphone = (qp.get('p') || '').replace(/\D/g, '').slice(0, 15);
+    // Shp-параметры в АЛФАВИТНОМ порядке (так требует Robokassa и в подписи, и в URL).
+    const shpParams = { Shp_service: code };
+    if (cname)  shpParams.Shp_name  = cname;
+    if (cphone) shpParams.Shp_phone = cphone;
+    const shpKeys  = Object.keys(shpParams).sort();                                // name, phone, service
+    const shpPairs = shpKeys.map(function (k) { return k + '=' + shpParams[k]; });  // СЫРЫЕ значения — в подпись
+
+    // Фискальный чек (Робочеки СМЗ для самозанятого). Robokassa сам отправит чек покупателю и в «Мой налог».
+    //  • sno НЕ передаём — в рамках Робочеки СМЗ система подставит корректный СНО сама.
+    //  • tax:'none' (самозанятый — без НДС); при необходимости Robokassa скорректирует.
+    //  • sum по позиции = OutSum (одна услуга, кол-во 1).
+    const receipt = {
+      items: [{
+        name: svc.title,                 // ≤128 символов — попадёт в чек покупателю
+        quantity: 1,
+        sum: svc.amount,
+        payment_method: 'full_payment',  // полный расчёт (предоплата консультации)
+        payment_object: 'service',       // услуга
+        tax: 'none',
+      }],
+    };
+    // ВАЖНО (причина прошлой ошибки 29): в ПОДПИСЬ идёт СЫРОЙ JSON чека, а в URL — он же,
+    // но URL-кодированный (для транспорта). Robokassa на своей стороне url-декодирует параметр
+    // Receipt обратно в сырой JSON и считает подпись по нему — значит, и мы подписываем сырой JSON.
+    // Ссылку собираем вручную (URLSearchParams закодировал бы '%' повторно).
+    const receiptJson = JSON.stringify(receipt);            // сырой JSON — идёт в ПОДПИСЬ
+    const receiptEnc = encodeURIComponent(receiptJson);     // URL-кодированный — идёт в ССЫЛКУ
+
+    // Подпись инициации: MD5(MerchantLogin:OutSum:InvId:Receipt:Пароль#1[:Shp_* по алфавиту]),
+    // Receipt — СЫРОЙ JSON (НЕ url-кодированный).
+    const signature = md5([LOGIN, outSum, invId, receiptJson, PASS1].concat(shpPairs).join(':'));
+
+    const query =
+      'MerchantLogin=' + encodeURIComponent(LOGIN) +
+      '&OutSum=' + outSum +
+      '&InvId=' + invId +
+      '&Description=' + encodeURIComponent(svc.title) +
+      '&Receipt=' + receiptEnc +
+      '&SignatureValue=' + signature +
+      '&Culture=ru' +
+      '&Encoding=utf-8' +
+      shpKeys.map(function (k) { return '&' + k + '=' + encodeURIComponent(shpParams[k]); }).join('') +
+      (isTest ? '&IsTest=1' : '');
+
+    return redirect(res, 'https://auth.robokassa.ru/Merchant/Index.aspx?' + query);
+  } catch (e) {
+    return redirect(res, '/fail.html?e=server');
+  }
+};
